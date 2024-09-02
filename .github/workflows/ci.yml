@@ -1,0 +1,112 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: |
+          pytest
+        env:
+          PYTHONPATH: ${{ github.workspace }}  # Ensuring the PYTHONPATH is set to the project root
+
+      - name: Build Docker image
+        run: |
+          docker build -t my-python-app .
+
+      - name: Run Docker container
+        run: |
+          docker run -d -p 5000:5000 --name my-python-app-container my-python-app
+          echo "Waiting for the Flask app to start..."
+          for i in {1..5}; do
+            if curl -f http://localhost:5000; then
+              echo "App is up!"
+              break
+            else
+              echo "App is not ready yet. Retrying in 5 seconds..."
+              sleep 5
+            fi
+            if [ $i -eq 5 ]; then
+              echo "App failed to start in time. Exiting."
+              docker logs my-python-app-container
+              exit 1
+            fi
+          done
+
+      - name: Push Docker image (optional)
+        if: github.event_name == 'push'
+        env:
+          DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+          DOCKER_HUB_ACCESS_TOKEN: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+        run: |
+          echo "$DOCKER_HUB_ACCESS_TOKEN" | docker login -u "$DOCKER_HUB_USERNAME" --password-stdin
+          docker tag my-python-app $DOCKER_HUB_USERNAME/my-python-app:latest
+          docker push $DOCKER_HUB_USERNAME/my-python-app:latest
+
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            # Ensure Docker is installed
+            if ! command -v docker &> /dev/null; then
+              echo "Docker not found, installing..."
+              sudo yum update -y
+              sudo yum install -y docker
+              sudo systemctl start docker
+              sudo systemctl enable docker
+              sudo usermod -aG docker aishwar
+            fi
+
+            # Pull Docker image and run container
+            echo "Pulling Docker image..."
+            sudo docker pull takkadapelly/my-python-app
+
+            echo "Stopping and removing old container..."
+            sudo docker stop my-app || true
+            sudo docker rm my-app || true
+
+            echo "Running new container..."
+            sudo docker run -d -p 5000:5000 --name my-app takkadapelly/my-python-app:latest
+          timeout: 30s
+          command_timeout: 10m
+          debug: false
